@@ -12,6 +12,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 import bus
+from notifier import push_reject
 import fields
 import logutil
 from runtime import Ctx, coin_label, parse_iso, short_addr
@@ -304,6 +305,8 @@ class Auditor:
                  f"Auditor · {reason}", "Skipped"),
             )
         conn.commit()
+        if not passed and forward:
+            await push_reject(ctx.notifier, cfg, mint, coin_label(conn, mint), "Auditor", str(reason))
         log.info(f"{mint}\tverdict\t{'passed 8/8' if passed else 'rejected: ' + str(reason)}")
         bus.publish("audit", out)
         if passed and forward:

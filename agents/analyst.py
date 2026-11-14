@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 import bus
+from notifier import push_reject
 import logutil
 from config import read_secret
 from runtime import Ctx, coin_label
@@ -207,6 +208,9 @@ class Analyst:
                  f"{who} · {failed[0]}", "Skipped"),
             )
         conn.commit()
+        if not passed:
+            await push_reject(ctx.notifier, cfg, mint, coin_label(conn, mint),
+                              "Analyst (rules)" if rules else "Analyst", str(failed[0]))
         nums = " ".join(f"{k}={a.get(k)}" for k in NAMES)
         log.info(f"{mint}\tstate {state_hash}\t{nums}\tscore {score}\t"
                  f"{'pass' if passed else 'reject: ' + failed[0]}\ttokens {tokens}\tmodel {model}")

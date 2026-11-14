@@ -569,7 +569,8 @@
 
   /* ------------------------------------------------------------ actions (plan A writes) */
   async function setSetting(key, value) {
-    try { const r = await post("/api/settings", { key, value }); toast(r.message || "Saved"); }
+    try { const r = await post("/api/settings", { key, value });
+      toast((r.message || "Saved") + (r.ticket && r.ticket.message ? " · " + r.ticket.message : "")); }
     catch (e) { toast(e.message); }
     refresh();
   }

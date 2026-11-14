@@ -155,6 +155,16 @@ class Notifier:
             return False
 
 
+async def push_reject(notifier: "Notifier", cfg: dict[str, Any], mint: str, name: str,
+                      who: str, reason: str) -> bool:
+    """STEP 10 push_rejects (default false): when true, every reject that writes an
+    Activity "Rejected X" row is also pushed, with its FOMO link from links.py."""
+    if not cfg.get("push_rejects"):
+        return False
+    return await notifier.push(f"Rejected {name} · {who} · {reason}", mode=cfg["mode"], mint=mint,
+                               buttons=[fomo_button("Open on FOMO", mint)], kind="reject", retries=1)
+
+
 class TelegramError(Exception):
     """Telegram API failure. The message never contains the token or URL."""
 

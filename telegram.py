@@ -325,7 +325,7 @@ class Desk:
             return [_r("Mode switches with: paper | live")]
         r = config.set_value(self.conn, key, val, who="telegram")
         out = r["message"]
-        if r.get("ticket") and not r["ticket"].get("ok", True):
+        if r.get("ticket") and r["ticket"].get("message"):     # bump: tell; skip: warn
             out += "\n" + r["ticket"]["message"]
         await self.changed()
         return [_r(out)]
