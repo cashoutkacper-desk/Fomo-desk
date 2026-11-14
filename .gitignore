@@ -25,3 +25,6 @@ site/
 
 # private master prompt, not code
 spec/
+
+# local proof screenshots (real desk data)
+proof/
