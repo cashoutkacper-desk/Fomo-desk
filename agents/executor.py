@@ -61,6 +61,8 @@ class Executor:
 
     async def handle(self, msg: dict) -> dict | None:
         ctx, conn = self.ctx, self.ctx.conn
+        if ctx.night_hook is not None:
+            await ctx.night_hook()       # STEP 11: the ticket check runs before the first coin of a night
         cfg = ctx.cfg()
         mode = cfg["mode"]
         mint = msg["analyst"]["mint"]

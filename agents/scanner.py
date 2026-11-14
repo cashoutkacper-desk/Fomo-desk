@@ -25,6 +25,9 @@ log = logutil.get("scanner")
 RECONNECT_ALERT_PER_HOUR = 10   # STEP 12: "More than 10 websocket reconnects in the last hour"
 
 
+ON_MIGRATION_CAP_S = 60     # wall-clock cap on handling 1 migration message (RPC/Dex inside)
+POLL_CAP_S = 120            # wall-clock cap on 1 waiting-room poll
+
 class QuietTimeout(Exception):
     """Our own idle timeout: no message for ws_silence_s, socket still fine."""
 
@@ -327,8 +330,9 @@ class Scanner:
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20,
-                                              open_timeout=20, max_size=2**20) as ws:
-                    await ws.send(json.dumps({"method": "subscribeMigration"}))
+                                              open_timeout=20, close_timeout=5, max_size=2**20) as ws:
+                    # every await on the socket has a wall-clock cap (a dead socket can't freeze us)
+                    await asyncio.wait_for(ws.send(json.dumps({"method": "subscribeMigration"})), 10)
                     log.info("ws_open")
                     backoff = 1  # a good open resets the backoff
                     silence = self.ctx.cfg()["scanner.ws_silence_s"]
@@ -343,7 +347,10 @@ class Scanner:
                         except ValueError:
                             continue
                         if isinstance(msg, dict):
-                            await self.on_migration(msg)
+                            try:
+                                await asyncio.wait_for(self.on_migration(msg), ON_MIGRATION_CAP_S)
+                            except asyncio.TimeoutError:
+                                log.info(f"on_migration_timeout\t{ON_MIGRATION_CAP_S}s\t{str(msg.get('mint'))[:44]}")
             except asyncio.CancelledError:
                 raise
             except QuietTimeout:
@@ -360,7 +367,9 @@ class Scanner:
             cfg = self.ctx.cfg()
             if not bus.is_paused("scanner"):
                 try:
-                    await self.poll_once()
+                    await asyncio.wait_for(self.poll_once(), POLL_CAP_S)
+                except asyncio.TimeoutError:
+                    log.info(f"poll_timeout\t{POLL_CAP_S}s\troom={len(self.room)}")
                 except RateLimited:
                     log.info(f"dexscreener_429\twait {cfg['scanner.dex_429_wait_s']}s\troom={len(self.room)}")
                     await asyncio.sleep(cfg["scanner.dex_429_wait_s"])

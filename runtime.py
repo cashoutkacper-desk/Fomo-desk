@@ -27,6 +27,7 @@ class Ctx:
     notifier: Any                # notifier.Notifier
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
     fast: bool = False           # tests: no real sleeps between retries
+    night_hook: Any = None       # async () -> None: STEP 10/11 ticket check before the first coin of a night
 
     def now(self) -> datetime:
         return self.clock()

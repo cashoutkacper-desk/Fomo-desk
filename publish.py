@@ -254,10 +254,14 @@ async def run(conn, telegram_connected: bool = False, dex=None, deployer: GhPage
         try:
             if loop.time() - last_prices >= PRICES_EVERY_S:
                 last_prices = loop.time()
-                await pub.prices_once()
+                try:
+                    await asyncio.wait_for(pub.prices_once(), 60)   # wall-clock cap
+                except asyncio.TimeoutError:
+                    log.info("prices_timeout\t60s")
             pub.write_all()
             if deployer is not None:
-                await asyncio.to_thread(deployer.deploy)
+                # git runs with subprocess timeout=120 (killed on expiry); this caps the wait too
+                await asyncio.wait_for(asyncio.to_thread(deployer.deploy), 150)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

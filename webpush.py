@@ -52,7 +52,7 @@ def send_sync(conn, line: str, url: str, icon: str | None = None,
     for ep, p256dh, auth in subs:
         try:
             sender(subscription_info={"endpoint": ep, "keys": {"p256dh": p256dh, "auth": auth}},
-                   data=data, vapid_private_key=key, vapid_claims={"sub": VAPID_SUB}, ttl=3600)
+                   data=data, vapid_private_key=key, vapid_claims={"sub": VAPID_SUB}, ttl=3600, timeout=10)
             sent += 1
         except Exception as e:  # pywebpush.WebPushException carries .response
             status = getattr(getattr(e, "response", None), "status_code", None)

@@ -177,6 +177,7 @@ class TelegramNotifier(Notifier):
     owner_chat_id: int | None = None
     client: Any = None                     # httpx.AsyncClient
     token_getter: Any = None               # callable -> token; default reads secrets/TG_TOKEN
+    wall_margin_s: float = 10.0            # hard cap = httpx timeout + this (tests shrink it)
 
     def _token(self) -> str:
         tok = (self.token_getter or (lambda: read_secret("TG_TOKEN")))()
@@ -190,7 +191,11 @@ class TelegramNotifier(Notifier):
         own = self.client is None
         client = self.client or httpx.AsyncClient()
         try:
-            r = await client.post(TG_API.format(token=self._token(), method=method), json=payload, timeout=timeout)
+            # hard wall-clock cap: httpx timeouts are per-read, a half-dead socket can hang forever
+            r = await asyncio.wait_for(
+                client.post(TG_API.format(token=self._token(), method=method), json=payload, timeout=timeout),
+                timeout + self.wall_margin_s,
+            )
             body = r.json()
         except TelegramError:
             raise

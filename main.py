@@ -72,7 +72,7 @@ def _night_file():
     return config.LOG_DIR / "ticket_check_night.txt"
 
 
-async def check_night_once(ctx: Ctx) -> str:
+async def check_night_once(ctx: Ctx, quiet: bool = False) -> str:
     """Ticket check once per night: a restart inside the same night doesn't repeat it."""
     night = ctx.night_start()
     f = _night_file()
@@ -81,7 +81,7 @@ async def check_night_once(ctx: Ctx) -> str:
         await start_of_night(ctx)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(night)
-    else:
+    elif not quiet:
         log.info("ticket_check\talready done this night")
     return night
 
@@ -126,6 +126,7 @@ async def main() -> None:
     ctx = Ctx(conn=conn, src=src, notifier=notif)
     log.info(f"start\tmode {cfg['mode']}\tanalyst {cfg['analyst_mode']}\tnotifier {notif.channel}")
     first_night = await check_night_once(ctx)
+    ctx.night_hook = lambda: check_night_once(ctx, quiet=True)
 
     host = os.environ.get("DESK_HOST", "127.0.0.1")
     port = int(os.environ.get("DESK_PORT", "8000"))

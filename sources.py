@@ -33,6 +33,17 @@ class RateLimited(Exception):
     """HTTP 429 from a source."""
 
 
+async def capped(aw, seconds: float, what: str):
+    """Hard wall-clock cap on one network await. httpx timeouts are per phase
+    (connect/read/write), so a half-dead socket that drips bytes can outlive them;
+    this never can. Raises SourceError("<what> timeout") so callers treat it like
+    any other source failure (retry / no data), never a frozen loop."""
+    try:
+        return await asyncio.wait_for(aw, seconds)
+    except asyncio.TimeoutError:
+        raise SourceError(f"{what} timeout after {seconds:g}s") from None
+
+
 class SourceError(Exception):
     pass
 
@@ -161,7 +172,7 @@ class Dex:
             chunk = mints[i : i + 30]
             await self._budget()
             self.requests += 1
-            r = await self.client.get(DEX_URL.format(mints=",".join(chunk)), timeout=15)
+            r = await capped(self.client.get(DEX_URL.format(mints=",".join(chunk)), timeout=15), 25, "dexscreener")
             if r.status_code == 429:
                 raise RateLimited("dexscreener")
             if r.status_code != 200:
@@ -185,7 +196,7 @@ class Rpc:
     async def call(self, method: str, params: list, timeout: float = 20) -> Any:
         self.calls += 1
         body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        r = await self.client.post(self.url_getter(), json=body, timeout=timeout)
+        r = await capped(self.client.post(self.url_getter(), json=body, timeout=timeout), timeout + 10, f"rpc {method}")
         if r.status_code == 429:
             raise RateLimited(f"rpc {method}")
         if r.status_code != 200:
@@ -297,7 +308,7 @@ class RugCheck:
         self.client = client
 
     async def _get(self, url: str) -> Any:
-        r = await self.client.get(url, timeout=20)
+        r = await capped(self.client.get(url, timeout=20), 30, "rugcheck")
         if r.status_code == 429:
             raise RateLimited("rugcheck")
         if r.status_code != 200:
@@ -323,9 +334,9 @@ class Jev:
         if not key:
             raise SourceError("no Jev key")
         body = {"model": "jev-latest", "state": state, "questions": questions}
-        r = await self.client.post(
+        r = await capped(self.client.post(
             JEV_URL, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=timeout
-        )
+        ), timeout + 5, "jev")
         if r.status_code == 429:
             raise RateLimited("jev")
         if r.status_code != 200:

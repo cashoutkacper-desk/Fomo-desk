@@ -226,8 +226,8 @@ class Risk:
             while True:
                 cfg = self.ctx.cfg()
                 try:
-                    await self.poll_once()
-                except Exception as e:  # noqa: BLE001
+                    await asyncio.wait_for(self.poll_once(), 60)   # wall-clock cap on 1 poll
+                except Exception as e:  # noqa: BLE001  (TimeoutError lands here too)
                     from sources import RateLimited
                     if isinstance(e, RateLimited):
                         missed = max(1, cfg["risk.backoff_429_s"] // cfg["risk.poll_s"])
