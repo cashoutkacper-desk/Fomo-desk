@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -87,7 +87,7 @@ def test_state(env):
 def test_chart_ranges_and_marks(env):
     ctx, cl = env
     c = ctx.conn
-    now = ctx.now()
+    now = datetime.now(timezone.utc)   # the API charts against the real clock
     c.execute("INSERT INTO positions(mint, opened_at, entry_price, size_usd, peak_price, stop_price, trail_active,"
               " closed_at, exit_price, exit_reason, pnl_usd, fees_usd, mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (MINT, iso(now - timedelta(minutes=10)), 1.0, 47.5, 1.0, 0.92, 0, iso(now - timedelta(minutes=5)),

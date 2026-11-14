@@ -70,7 +70,15 @@ def render_plain(msg: dict[str, Any]) -> str:
 
 
 def telegram_markup(buttons: list[dict[str, str]]) -> dict | None:
-    """Inline keyboard: URL buttons carry the exact links.py string, 1 row."""
+    """Inline keyboard: URL buttons carry the exact links.py string. 1 row, unless a
+    button carries "row": n (STEP 9 lists, e.g. "which coin?")."""
+    if any("row" in b for b in buttons):
+        rows: dict[int, list] = {}
+        for b in buttons:
+            m = telegram_markup([{k: v for k, v in b.items() if k != "row"}])
+            if m:
+                rows.setdefault(int(b.get("row", 0)), []).extend(m["inline_keyboard"][0])
+        return {"inline_keyboard": [rows[k] for k in sorted(rows)]} if rows else None
     row = []
     for b in buttons:
         if b.get("url"):
@@ -166,13 +174,13 @@ class TelegramNotifier(Notifier):
             raise TelegramError("no TG_TOKEN")
         return "".join(tok.split())        # strip ALL whitespace
 
-    async def _call(self, method: str, payload: dict) -> dict:
+    async def _call(self, method: str, payload: dict, timeout: float = 20) -> dict:
         import httpx
 
         own = self.client is None
         client = self.client or httpx.AsyncClient()
         try:
-            r = await client.post(TG_API.format(token=self._token(), method=method), json=payload, timeout=20)
+            r = await client.post(TG_API.format(token=self._token(), method=method), json=payload, timeout=timeout)
             body = r.json()
         except TelegramError:
             raise

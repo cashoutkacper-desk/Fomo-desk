@@ -19,6 +19,7 @@ import db
 import logutil
 from agents import analyst, auditor, executor, risk, scanner
 import notifier as notifier_mod
+import telegram
 from runtime import Ctx, iso
 from sources import Sources
 
@@ -115,6 +116,11 @@ async def main() -> None:
         others.append(asyncio.create_task(
             publish.run(conn, telegram_connected=tg, dex=src.dex,
                         deployer=deployer if deployer.enabled() else None), name="publish"))
+    if tg:
+        # STEP 9: long polling, owner only; commands + [Bought]/[Skip]/[Sold] callbacks
+        others.append(asyncio.create_task(
+            telegram.run_polling(conn, notif, auditor=auditor.Auditor(ctx), dex=src.dex,
+                                 on_change=publish.request_republish), name="telegram"))
     others.append(asyncio.create_task(server.serve(), name="api"))  # keep last (clean shutdown)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

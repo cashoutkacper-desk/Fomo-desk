@@ -232,8 +232,20 @@ class GhPagesDeployer:
         return self.last_sha
 
 
+_kick: asyncio.Event | None = None
+
+
+def request_republish() -> None:
+    """STEP 9: after a Telegram change (setting, pause, mode) write the files now and
+    deploy as soon as the Pages throttle allows, instead of waiting for the next tick."""
+    if _kick is not None:
+        _kick.set()
+
+
 async def run(conn, telegram_connected: bool = False, dex=None, deployer: GhPagesDeployer | None = None) -> None:
     """Plan B loop: files every 15s, prices every 60s, deploy when allowed."""
+    global _kick
+    _kick = asyncio.Event()
     pub = Publisher(conn, telegram_connected=telegram_connected, dex=dex)
     pub.copy_web()
     last_prices = 0.0
@@ -250,4 +262,8 @@ async def run(conn, telegram_connected: bool = False, dex=None, deployer: GhPage
             raise
         except Exception as e:  # noqa: BLE001
             log.info(f"publish_error\t{type(e).__name__}: {e}")
-        await asyncio.sleep(WRITE_EVERY_S)
+        try:
+            await asyncio.wait_for(_kick.wait(), timeout=WRITE_EVERY_S)
+        except asyncio.TimeoutError:
+            pass
+        _kick.clear()

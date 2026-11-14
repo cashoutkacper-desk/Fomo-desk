@@ -137,7 +137,10 @@ class Auditor:
         log.info(f"source_failed\tlayer {layer}\t{type(last).__name__}: {last}")
         raise NoData(NO_DATA_NAME[layer])
 
-    async def audit(self, scan: dict) -> dict:
+    async def audit(self, scan: dict, forward: bool = True) -> dict:
+        """forward=False: an on-demand audit (STEP 9 "buy X" for a coin never pushed).
+        The 8 layers are written to db.audits, but nothing goes to Analyst and no
+        Activity row is written: "not sized, not on the desk"."""
         ctx, conn = self.ctx, self.ctx.conn
         cfg = ctx.cfg()
         mint = scan["mint"]
@@ -293,7 +296,7 @@ class Auditor:
             )
         out = {"agent": "auditor", "mint": mint, "ts": ctx.now_iso(), "passed": passed,
                "layersChecked": checked, "layers": layers, "holders": holders_out, "reason": reason}
-        if not passed:
+        if not passed and forward:
             self.rejected += 1
             conn.execute(
                 "INSERT INTO activity(ts, kind, mint, agent, title, subtitle, value) VALUES (?,?,?,?,?,?,?)",
@@ -303,7 +306,7 @@ class Auditor:
         conn.commit()
         log.info(f"{mint}\tverdict\t{'passed 8/8' if passed else 'rejected: ' + str(reason)}")
         bus.publish("audit", out)
-        if passed:
+        if passed and forward:
             await bus.auditor_to_analyst.put({"scanner": scan, "auditor": out})
         return out
 
