@@ -1,0 +1,27 @@
+# secrets and tokens — never commit
+secrets/
+.env
+.env.*
+
+# local environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# sqlite (WAL)
+*.db
+*.db-wal
+*.db-shm
+
+# logs (including raw samples)
+logs/
+
+# plan B published site (gh-pages working tree, holds d/<DATA_PATH>/)
+site/
+
+# private master prompt, not code
+spec/
