@@ -1,0 +1,5 @@
+#!/bin/sh
+# STEP 12 · hourly routine entry: `ssh root@<server> desk-health`. Runs as user desk.
+cd /home/desk/desk || exit 2
+if [ "$(id -u)" = 0 ]; then exec sudo -u desk -H env PYTHONPATH=. .venv/bin/python health.py "$@"; fi
+exec env PYTHONPATH=. .venv/bin/python health.py "$@"

@@ -1,0 +1,5 @@
+#!/bin/sh
+# STEP 12 · daily routine entry: `desk-night-report export` | `desk-night-report finalize <https url>`.
+cd /home/desk/desk || exit 2
+if [ "$(id -u)" = 0 ]; then exec sudo -u desk -H env PYTHONPATH=. .venv/bin/python night_report.py "$@"; fi
+exec env PYTHONPATH=. .venv/bin/python night_report.py "$@"
