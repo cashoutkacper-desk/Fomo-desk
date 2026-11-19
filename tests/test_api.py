@@ -73,6 +73,9 @@ def test_health_open(env):
 
 def test_state(env):
     ctx, cl = env
+    # the API counts tonight's audits against the real clock (like the charts), so date them now
+    ctx.conn.execute("UPDATE audits SET ts=?", (iso(datetime.now(timezone.utc)),))
+    ctx.conn.commit()
     r = cl.get("/api/state", headers={"X-App-Token": TOKEN})
     assert r.status_code == 200
     s = r.json()
