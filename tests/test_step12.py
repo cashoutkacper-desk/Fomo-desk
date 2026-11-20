@@ -51,7 +51,8 @@ def test_healthy_does_nothing(tmp_path):
     ctx = make_ctx(tmp_path)
     _beats(ctx.conn, NOW, ALL_FRESH)
     res, calls = _health(ctx, tmp_path)
-    assert res == {"ok": True, "restarted": [], "down_min": 0, "reconnects_1h": 0, "alerted": False}
+    assert res == {"ok": True, "restarted": [], "down_min": 0, "reconnects_1h": 0, "alerted": False,
+                   "already_alerted": False, "feed_down_since": None}
     assert calls == [] and ctx.notifier.sent == []
 
 
@@ -92,6 +93,7 @@ def _scanner_log(tmp_path, now_local, real: int, quiet: int, old: int = 0):
     for i in range(real):
         t = now_local - timedelta(minutes=2 + i * 4)
         lines.append(f"{t:%Y-%m-%d %H:%M:%S},000\tws_disconnect\t{i + 1}\tConnectionClosedError\tbackoff=2s\tlast_hour={i + 1}")
+        lines.append(f"{t:%Y-%m-%d %H:%M:%S},500\tws_open")          # flapping, but it reconnects
     for i in range(quiet):
         t = now_local - timedelta(minutes=1 + i * 2)
         lines.append(f"{t:%Y-%m-%d %H:%M:%S},000\tws_quiet_reconnect\t{i + 1}\tidle 120s")
@@ -132,6 +134,7 @@ def test_alert_deduplicated_when_main_already_sent_it_this_hour(tmp_path):
     (tmp_path / "notifier.log").write_text(f"2026-11-20 07:45:00,000\t{json.dumps(rec)}\n")
     res, _ = _health(ctx, tmp_path)
     assert res["reconnects_1h"] == 12 and res["alerted"] is False and ctx.notifier.sent == []
+    assert res["already_alerted"] is True
     # an alert older than an hour does not block a new one
     rec["ts"] = iso(NOW - timedelta(minutes=61))
     (tmp_path / "notifier.log").write_text(f"2026-11-20 07:04:00,000\t{json.dumps(rec)}\n")
@@ -296,3 +299,54 @@ def test_report_command_returns_the_url(tmp_path):
     run(night_report.finalize(ctx.conn, ctx.notifier, PAGE))
     replies = run(Desk(ctx.conn).handle("report"))
     assert replies[0]["text"] == f"Last morning Page:\n{PAGE}"
+
+
+# ------------------------------------------------------------------ Nov 20: feed refused for hours
+
+def _refused_log(tmp_path, now_local, minutes=70):
+    """Like 04:06-08:30 AM Nov 20: one ConnectionClosed, then refused every 60 s, no ws_open."""
+    start = now_local - timedelta(minutes=minutes)
+    lines = [f"{start - timedelta(minutes=2):%Y-%m-%d %H:%M:%S},000\tws_open",
+             f"{start:%Y-%m-%d %H:%M:%S},000\tws_disconnect\t1\tConnectionClosedError\tbackoff=1s\tlast_hour=1"]
+    for i in range(1, minutes):
+        t = start + timedelta(minutes=i)
+        lines.append(f"{t:%Y-%m-%d %H:%M:%S},000\tws_disconnect\t{i + 1}\tConnectionRefusedError\tbackoff=60s\tlast_hour=60")
+    (tmp_path / "scanner.log").write_text("\n".join(lines) + "\n")
+    return start
+
+
+def test_feed_refused_for_an_hour_alerts_with_down_since(tmp_path):
+    ctx = make_ctx(tmp_path)
+    _beats(ctx.conn, NOW, ALL_FRESH)
+    nl = NOW.replace(tzinfo=None)
+    start = _refused_log(tmp_path, nl)
+    res, _ = _health(ctx, tmp_path)
+    assert res["reconnects_1h"] == 60 and res["alerted"] is True and res["already_alerted"] is False
+    assert res["feed_down_since"] == f"{start:%Y-%m-%d %H:%M}"
+    assert ctx.notifier.sent[-1]["text"] == (f"Websocket dropped 60 times in the last hour (PumpPortal) · feed down since "
+                                             f"{start:%-I:%M %p} (connection refused), no new coins until it reconnects")
+
+
+def test_reconnects_60_with_desk_alert_this_hour_reports_already_alerted(tmp_path):
+    """What happened overnight: reconnects_1h=60, alerted=false because main.py's Scanner had
+    already sent 'Websocket dropped ...' that hour (05:11, 06:11, 07:11, 08:11 AM)."""
+    ctx = make_ctx(tmp_path)
+    _beats(ctx.conn, NOW, ALL_FRESH)
+    _refused_log(tmp_path, NOW.replace(tzinfo=None))
+    rec = {"ts": iso(NOW - timedelta(minutes=54)), "kind": "alert",
+           "text": "Websocket dropped 60 times in the last hour (PumpPortal)"}
+    (tmp_path / "notifier.log").write_text(f"2026-11-20 07:11:00,000\t{json.dumps(rec)}\n")
+    res, _ = _health(ctx, tmp_path)
+    assert res["alerted"] is False and res["already_alerted"] is True and res["feed_down_since"] is not None
+    assert ctx.notifier.sent == []
+
+
+def test_quiet_reconnects_all_night_are_not_drops_and_feed_is_up(tmp_path):
+    nl = NOW.replace(tzinfo=None)
+    lines = []
+    for i in range(30):                                   # idle 120 s reconnects, every 2 min
+        t = nl - timedelta(minutes=60 - 2 * i)
+        lines += [f"{t:%Y-%m-%d %H:%M:%S},000\tws_quiet_reconnect\t{i}\tidle 120s", f"{t:%Y-%m-%d %H:%M:%S},050\tws_open"]
+    (tmp_path / "scanner.log").write_text("\n".join(lines) + "\n")
+    assert health.count_reconnects(tmp_path, nl) == 0
+    assert health.feed_state(tmp_path, nl)["down"] is False

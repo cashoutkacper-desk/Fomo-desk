@@ -9,6 +9,7 @@ Authorization header; it is never logged.
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import time
 from typing import Any
@@ -102,6 +103,9 @@ def bonding_curve_address(mint: str) -> str:
     return find_program_address([b"bonding-curve", b58decode(mint)], PUMP_PROGRAM)
 
 
+GPA_MAX_BYTES = 16_000_000   # a fresh pumpfun coin is a few hundred accounts (< 1 MB)
+
+
 # ------------------------------------------------------------------ DexScreener
 
 def pick_pumpswap_pair(pairs: list[dict], mint: str) -> dict | None:
@@ -193,18 +197,35 @@ class Rpc:
         self.url_getter = url_getter  # callable -> settings.rpc_url (live)
         self.calls = 0
 
-    async def call(self, method: str, params: list, timeout: float = 20) -> Any:
+    async def call(self, method: str, params: list, timeout: float = 20, max_bytes: int | None = None) -> Any:
+        """max_bytes: refuse a response bigger than this (read as a stream, never fully
+        buffered). getProgramAccounts on an old, widely held token (e.g. PUMP, millions
+        of accounts) otherwise blows the 700 MB memory cap: Nov 19 18:28-19:18 OOM loop."""
         self.calls += 1
         body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        r = await capped(self.client.post(self.url_getter(), json=body, timeout=timeout), timeout + 10, f"rpc {method}")
-        if r.status_code == 429:
+        if max_bytes is None:
+            r = await capped(self.client.post(self.url_getter(), json=body, timeout=timeout), timeout + 10, f"rpc {method}")
+            status, j = r.status_code, (r.json() if r.status_code == 200 else None)
+        else:
+            status, j = await capped(self._post_capped(body, timeout, max_bytes, method), timeout + 10, f"rpc {method}")
+        if status == 429:
             raise RateLimited(f"rpc {method}")
-        if r.status_code != 200:
-            raise SourceError(f"rpc {method} HTTP {r.status_code}")
-        j = r.json()
+        if status != 200:
+            raise SourceError(f"rpc {method} HTTP {status}")
         if "error" in j:
             raise SourceError(f"rpc {method} error {j['error'].get('code')}")
         return j.get("result")
+
+    async def _post_capped(self, body: dict, timeout: float, max_bytes: int, method: str):
+        async with self.client.stream("POST", self.url_getter(), json=body, timeout=timeout) as r:
+            if r.status_code != 200:
+                return r.status_code, None
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise SourceError(f"rpc {method} response over {max_bytes // 1_000_000} MB (too many accounts)")
+            return 200, json.loads(bytes(buf))
 
     async def account_info(self, pubkey: str) -> dict | None:
         """getAccountInfo jsonParsed, wrapped like the raw sample ({'result': ...})."""
@@ -259,7 +280,7 @@ class Rpc:
             res = await self.call(
                 "getProgramAccounts",
                 [prog, {"encoding": "jsonParsed", "filters": filters}],
-                timeout=40,
+                timeout=40, max_bytes=GPA_MAX_BYTES,
             )
             out.extend(res or [])
         return out

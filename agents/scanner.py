@@ -17,7 +17,7 @@ import fields
 import logutil
 from db import insert_price
 from runtime import Ctx, iso, parse_iso
-from sources import RC_SRC, RateLimited, bonding_curve_address, top10_pct
+from sources import PUMP_PROGRAM, RC_SRC, RateLimited, bonding_curve_address, top10_pct
 
 WS_URL = "wss://pumpportal.fun/api/data"
 PP_SRC = "pumpportal_migration.json"
@@ -61,6 +61,23 @@ class ReconnectTracker:
 
     def real_last_hour(self, now: float) -> int:
         return sum(1 for t in self.real_times if now - t < 3600)
+
+
+FEED_DOWN_AFTER_S = 300   # no good open for 5 min while failing = "feed down" in the alert
+
+
+def alert_text(n: int, down_since: float | None, err: str | None, now: float) -> str:
+    """'Websocket dropped {n} times in the last hour (PumpPortal)' (STEP 12 text, desk-health
+    dedupes on that prefix) + when no connect has worked for 5 min: since when and why,
+    because then no new coin is coming in at all."""
+    text = f"Websocket dropped {n} times in the last hour (PumpPortal)"
+    if down_since is not None and now - down_since >= FEED_DOWN_AFTER_S:
+        from datetime import datetime, timezone
+        from runtime import local_hhmm
+        since = local_hhmm(iso(datetime.fromtimestamp(down_since, timezone.utc)))
+        why = {"ConnectionRefusedError": "connection refused"}.get(err or "", err or "error")
+        text += f" · feed down since {since} ({why}), no new coins until it reconnects"
+    return text
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -134,6 +151,9 @@ class Scanner:
         self.tracker = ReconnectTracker()
         self.migrations = 0
         self.ignored = 0
+        self.last_open: float | None = None      # time.time() of the last good ws open
+        self.down_since: float | None = None     # first failed connect since then
+        self.last_error: str | None = None
         self.pools_seen = 0
 
     # ---------- intake
@@ -166,6 +186,10 @@ class Scanner:
             "SELECT 1 FROM scans WHERE mint=? AND ts>=?", (mint, self.ctx.night_start())
         ).fetchone():
             return None
+        if not await self.is_pumpfun_coin(mint):
+            self.ignored += 1
+            log.info(f"ignored\t{mint}\tnot a pumpfun curve coin (pump-amm pool for another token)")
+            return None
         self.migrations += 1
         # PumpPortal has no migration time key (fields.py: migration_time = null) -> receive time.
         mig = self.ctx.now_iso()
@@ -180,6 +204,26 @@ class Scanner:
                            "creator_done": False, "view": None}
         log.info(f"migration\t{mint}\tsig={self.room[mint]['signature']}")
         return mint
+
+    async def is_pumpfun_coin(self, mint: str) -> bool:
+        """OWN: "every coin that graduates off the pumpfun curve ... nothing else".
+        PumpPortal also reports migrate/pump-amm for pools other tokens open on PumpSwap
+        (43 of 513 on Nov 19-20, incl. the PUMP token itself, whose millions of holders
+        OOM-killed the desk). Pumpfun mints end in 'pump'; any other mint must have a
+        pumpfun bonding-curve account. RPC down -> let it in (the size caps still hold)."""
+        if mint.endswith("pump"):
+            return True
+        try:
+            curve = bonding_curve_address(mint)
+        except Exception:  # noqa: BLE001  not a valid base58 key -> not a coin at all
+            return False
+        try:
+            info = await self.ctx.src.rpc.account_info(curve)
+        except Exception as e:  # noqa: BLE001
+            log.info(f"curve_check_failed\t{mint}\t{type(e).__name__}")
+            return True
+        value = ((info or {}).get("result") or {}).get("value")
+        return bool(value) and value.get("owner") == PUMP_PROGRAM
 
     async def fill_creator(self, mint: str) -> None:
         """Creator from RugCheck (PumpPortal has none) + its balance NOW."""
@@ -316,12 +360,19 @@ class Scanner:
             log.info(f"ws_quiet_reconnect\t{self.tracker.quiet}\tidle {self.ctx.cfg()['scanner.ws_silence_s']}s")
         else:
             n = self.tracker.real_last_hour(now)
+            if self.down_since is None:
+                self.down_since = now
+            self.last_error = err
             log.info(f"ws_disconnect\t{self.tracker.real}\t{err}\tbackoff={backoff}s\tlast_hour={n}")
         if alert:
             n = self.tracker.real_last_hour(now)
-            await self.ctx.notifier.message(f"Websocket dropped {n} times in the last hour (PumpPortal)",
-                                            kind="alert")
+            await self.ctx.notifier.message(alert_text(n, self.down_since, self.last_error, now), kind="alert")
         return alert
+
+    def on_open(self) -> None:
+        import time as _t
+        self.last_open, self.down_since, self.last_error = _t.time(), None, None
+        log.info("ws_open")
 
     async def ws_loop(self) -> None:
         import websockets
@@ -333,7 +384,7 @@ class Scanner:
                                               open_timeout=20, close_timeout=5, max_size=2**20) as ws:
                     # every await on the socket has a wall-clock cap (a dead socket can't freeze us)
                     await asyncio.wait_for(ws.send(json.dumps({"method": "subscribeMigration"})), 10)
-                    log.info("ws_open")
+                    self.on_open()
                     backoff = 1  # a good open resets the backoff
                     silence = self.ctx.cfg()["scanner.ws_silence_s"]
                     while True:

@@ -7,7 +7,8 @@ Run on the server as user desk (wrapper /usr/local/bin/desk-health):
   2. Real websocket reconnects (ws_disconnect, NOT ws_quiet_reconnect) in the last
      60 min from logs/scanner.log*. More than 10 -> one Telegram alert, unless the
      same alert already went out this hour (from main.py or an earlier run).
-Prints one JSON line: {ok, restarted, down_min, reconnects_1h, alerted}.
+Prints one JSON line: {ok, restarted, down_min, reconnects_1h, alerted, already_alerted,
+feed_down_since}. alerted=false + already_alerted=true = the desk's own alert went out this hour.
 Exit 0 = handled (healthy, or restarted and fresh again); 1 = still unhealthy.
 Never prints secrets; Telegram only to the owner chat (notifier).
 """
@@ -29,6 +30,7 @@ AGENTS = ("scanner", "auditor", "analyst", "executor", "risk")
 STALE_S = 120
 RECONNECT_ALERT_PER_HOUR = 10        # same threshold as agents/scanner.py
 ALERT_PREFIX = "Websocket dropped "  # same text main.py's scanner alert uses
+FEED_DOWN_AFTER_S = 300
 SERVICE = "desk.service"
 
 
@@ -86,6 +88,28 @@ def count_reconnects(log_dir: Path, now_local: datetime, window_s: int = 3600) -
         if m and since <= datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") <= now_local:
             n += 1
     return n
+
+
+def feed_state(log_dir: Path, now_local: datetime) -> dict:
+    """From scanner.log: is the PumpPortal feed down right now? Down = the last ws line
+    is a real ws_disconnect and no ws_open for FEED_DOWN_AFTER_S. Times are local."""
+    last_open = first_fail = None
+    err = None
+    for ln in _log_lines(log_dir, "scanner"):
+        parts = ln.split("\t")
+        m = _TS.match(ln)
+        if not m or len(parts) < 2:
+            continue
+        t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        if parts[1] == "ws_open":
+            last_open, first_fail, err = t, None, None
+        elif parts[1] == "ws_disconnect":
+            if first_fail is None:
+                first_fail = t
+            err = parts[3] if len(parts) > 3 else None
+    down = first_fail is not None and (now_local - first_fail).total_seconds() >= FEED_DOWN_AFTER_S
+    return {"down": down, "down_since": first_fail if down else None, "error": err if down else None,
+            "last_open": last_open}
 
 
 def alert_sent_this_hour(log_dir: Path, now: datetime) -> bool:
@@ -148,13 +172,24 @@ async def run(conn: sqlite3.Connection, notifier: Any, log_dir: Path, *,
                 waited += step_s
         for name, n in stale:
             await notifier.message(f"Restarted {name}, down {n} min", kind="health")
-    n_rec = count_reconnects(log_dir, now_local())
-    alerted = False
-    if n_rec > RECONNECT_ALERT_PER_HOUR and not alert_sent_this_hour(log_dir, now()):
-        alerted = await notifier.message(f"{ALERT_PREFIX}{n_rec} times in the last hour (PumpPortal)",
-                                         kind="alert")
+    nl = now_local()
+    n_rec = count_reconnects(log_dir, nl)
+    feed = feed_state(log_dir, nl)
+    alerted = already = False
+    if n_rec > RECONNECT_ALERT_PER_HOUR:
+        # main.py's Scanner alerts the moment it passes 10 (at most 1 per hour); this hourly
+        # check only sends if no such alert went out in the last 60 min -> already_alerted
+        already = alert_sent_this_hour(log_dir, now())
+        if not already:
+            text = f"{ALERT_PREFIX}{n_rec} times in the last hour (PumpPortal)"
+            if feed["down"]:
+                why = {"ConnectionRefusedError": "connection refused"}.get(feed["error"] or "", feed["error"] or "error")
+                text += (f" · feed down since {feed['down_since']:%-I:%M %p} ({why}),"
+                         " no new coins until it reconnects")
+            alerted = await notifier.message(text, kind="alert")
     return {"ok": fresh, "restarted": restarted, "down_min": max([n for _, n in stale], default=0),
-            "reconnects_1h": n_rec, "alerted": alerted}
+            "reconnects_1h": n_rec, "alerted": alerted, "already_alerted": already,
+            "feed_down_since": feed["down_since"].strftime("%Y-%m-%d %H:%M") if feed["down"] else None}
 
 
 def main() -> int:
