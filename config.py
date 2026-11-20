@@ -61,6 +61,9 @@ SPECS: tuple[Spec, ...] = (
     _s("scanner.max_dex_rpm", "scanner", 250, "int", 10, 290, step10=False),
     _s("scanner.ws_silence_s", "scanner", 120, "int", 30, 900, step10=False),
     _s("scanner.dex_429_wait_s", "scanner", 30, "int", 5, 300, step10=False),
+    # Kacper, Nov 20: after N connection refusals in a row wait M min, then the normal backoff
+    _s("scanner.refused_cooldown_after", "scanner", 10, "int", 2, 100, step10=False),
+    _s("scanner.refused_cooldown_min", "scanner", 15, "int", 1, 120, step10=False),
     # ---- auditor
     _s("auditor.enabled", "auditor", True, "bool"),
     _s("auditor.max_dev_pct", "auditor", 5.0, "float", 0, 100),

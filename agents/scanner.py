@@ -154,6 +154,8 @@ class Scanner:
         self.last_open: float | None = None      # time.time() of the last good ws open
         self.down_since: float | None = None     # first failed connect since then
         self.last_error: str | None = None
+        self.refused_streak = 0                   # connection refusals in a row (reset on open)
+        self.cooldowns = 0
         self.pools_seen = 0
 
     # ---------- intake
@@ -372,7 +374,25 @@ class Scanner:
     def on_open(self) -> None:
         import time as _t
         self.last_open, self.down_since, self.last_error = _t.time(), None, None
+        self.refused_streak = 0
         log.info("ws_open")
+
+    def next_wait(self, err: BaseException, backoff: float) -> float:
+        """Seconds to wait before the next connect. Normal: the backoff (1, 2, 4 ... 60).
+        Kacper, Nov 20: after [10] connection refusals in a row (PumpPortal blocking us)
+        wait [15] min once, then the normal backoff again; a good open resets the count."""
+        if not isinstance(err, ConnectionRefusedError):
+            self.refused_streak = 0
+            return backoff
+        self.refused_streak += 1
+        cfg = self.ctx.cfg()
+        if self.refused_streak >= cfg["scanner.refused_cooldown_after"]:
+            n, self.refused_streak = self.refused_streak, 0
+            self.cooldowns += 1
+            wait = cfg["scanner.refused_cooldown_min"] * 60
+            log.info(f"ws_cooldown\t{n} refusals in a row\twait {cfg['scanner.refused_cooldown_min']} min\tcooldown={self.cooldowns}")
+            return wait
+        return backoff
 
     async def ws_loop(self) -> None:
         import websockets
@@ -410,7 +430,7 @@ class Scanner:
                 continue
             except Exception as e:  # noqa: BLE001  socket error, server close, failed connect
                 await self.on_reconnect("real", type(e).__name__, backoff)
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(self.next_wait(e, backoff))
                 backoff = min(backoff * 2, 60)
 
     async def poll_loop(self) -> None:
