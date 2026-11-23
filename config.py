@@ -64,6 +64,10 @@ SPECS: tuple[Spec, ...] = (
     # Kacper, Nov 20: after N connection refusals in a row wait M min, then the normal backoff
     _s("scanner.refused_cooldown_after", "scanner", 10, "int", 2, 100, step10=False),
     _s("scanner.refused_cooldown_min", "scanner", 15, "int", 1, 120, step10=False),
+    # on-chain backup feed (Kacper Nov 23): poll pump.fun's migration authority over our RPC
+    _s("scanner.onchain_feed", "scanner", "on", "choice", choices=("on", "off"), step10=False),
+    _s("scanner.onchain_poll_s", "scanner", 15, "int", 5, 300, step10=False),
+    _s("scanner.onchain_safety_poll_s", "scanner", 60, "int", 15, 900, step10=False),
     # ---- auditor
     _s("auditor.enabled", "auditor", True, "bool"),
     _s("auditor.max_dev_pct", "auditor", 5.0, "float", 0, 100),

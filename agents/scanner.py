@@ -1,7 +1,8 @@
 """AGENT 1 · SCANNER. Counts and cuts. Never judges quality.
 
 Owns every coin that graduates off the pumpfun curve and lands on PumpSwap.
-Input: PumpPortal migrations (1 websocket), DexScreener batches, Solana RPC.
+Input: PumpPortal migrations (1 websocket) + on-chain backup feed (the pump.fun migration
+authority's transactions over our Solana RPC, Kacper Nov 23), DexScreener batches, Solana RPC.
 Output: 1 JSON per decision -> db.scans + app (pubsub "scan"); pass -> bus.scanner_to_auditor.
 """
 
@@ -10,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unicodedata
+from datetime import datetime, timezone
 from typing import Any
 
 import bus
@@ -27,6 +29,12 @@ RECONNECT_ALERT_PER_HOUR = 10   # STEP 12: "More than 10 websocket reconnects in
 
 ON_MIGRATION_CAP_S = 60     # wall-clock cap on handling 1 migration message (RPC/Dex inside)
 POLL_CAP_S = 120            # wall-clock cap on 1 waiting-room poll
+ONCHAIN_CAP_S = 90          # wall-clock cap on 1 on-chain backup poll
+ONCHAIN_DOWN_AFTER_S = 120  # PumpPortal not connected this long -> backup polls fast
+ONCHAIN_MAX_TRIES = 5       # getTransaction failures before a signature is dropped
+# pump.fun's migration authority signs every graduation (MigrateV2 onto PumpSwap).
+MIGRATION_AUTHORITY = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
+WSOL = "So11111111111111111111111111111111111111112"
 
 class QuietTimeout(Exception):
     """Our own idle timeout: no message for ws_silence_s, socket still fine."""
@@ -91,17 +99,46 @@ def why_text(err: str | None) -> str:
     return err
 
 
-def alert_text(n: int, down_since: float | None, err: str | None, now: float) -> str:
+def backup_text(backup: int | None) -> str:
+    """What happens to new coins while PumpPortal is down. backup = coins the on-chain
+    backup feed brought in during the last hour, None = backup feed switched off."""
+    if backup is None:
+        return "no new coins until it reconnects"
+    if backup == 0:
+        return "backup on-chain feed is active (no new coins in the last hour)"
+    return (f"backup on-chain feed is active ({backup} coin{'' if backup == 1 else 's'}"
+            " in the last hour), coins still coming in")
+
+
+def alert_text(n: int, down_since: float | None, err: str | None, now: float,
+               backup: int | None = None) -> str:
     """'Websocket dropped {n} times in the last hour (PumpPortal)' (STEP 12 text, desk-health
-    dedupes on that prefix) + when no connect has worked for 5 min: since when and why,
-    because then no new coin is coming in at all."""
+    dedupes on that prefix) + when no connect has worked for 5 min: since when and why, and
+    whether the on-chain backup feed is bringing coins in meanwhile."""
     text = f"Websocket dropped {n} times in the last hour (PumpPortal)"
     if down_since is not None and now - down_since >= FEED_DOWN_AFTER_S:
-        from datetime import datetime, timezone
         from runtime import local_hhmm
         since = local_hhmm(iso(datetime.fromtimestamp(down_since, timezone.utc)))
-        text += f" · feed down since {since} ({why_text(err)}), no new coins until it reconnects"
+        text += f" · feed down since {since} ({why_text(err)}), {backup_text(backup)}"
     return text
+
+
+def migrate_mints(tx: dict | None) -> list[str]:
+    """Graduated mint(s) in 1 migration-authority transaction: a successful tx whose logs
+    show pump.fun's Migrate instruction; the mint is the non-WSOL token in its balances
+    (LP / foreign mints are dropped later by is_pumpfun_coin)."""
+    meta = (tx or {}).get("meta") or {}
+    if meta.get("err") is not None:
+        return []
+    if not any("Instruction: Migrate" in ln for ln in meta.get("logMessages") or []):
+        return []
+    mints = []
+    for b in meta.get("postTokenBalances") or []:
+        m = b.get("mint")
+        if m and m != WSOL and m not in mints:
+            mints.append(m)
+    pump = [m for m in mints if m.endswith("pump")]
+    return pump or mints
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -181,6 +218,18 @@ class Scanner:
         self.refused_streak = 0                   # connection refusals in a row (reset on open)
         self.cooldowns = 0
         self.pools_seen = 0
+        # PumpPortal connection state for the on-chain backup feed
+        import time as _t
+        self.ws_connected = False
+        self.ws_lost_at: float = _t.time()        # since when not connected
+        # on-chain backup feed
+        self.seen: dict[str, float] = {}          # mint -> time.time() first received (dedupe)
+        self.onchain_cursor: str | None = None    # newest authority signature handled
+        self.onchain_retry: dict[str, list] = {}  # sig -> [tries, blockTime] (getTransaction failed)
+        self.onchain_times: list[float] = []      # time.time() of on-chain coins taken in
+        self.onchain_polls = 0
+        self.by_source = {"pumpportal": 0, "onchain": 0}
+        self.dupes = 0
 
     # ---------- intake
     def restore_room(self) -> None:
@@ -197,7 +246,11 @@ class Scanner:
                 self.room[m] = {"migratedAt": mig, "signature": None,
                                 "creator_done": creator is not None, "view": None}
 
-    async def on_migration(self, msg: dict) -> str | None:
+    async def on_migration(self, msg: dict, source: str = "pumpportal",
+                           migrated_at: str | None = None) -> str | None:
+        """1 migration from either feed, same message shape (PumpPortal keys).
+        source 'pumpportal' | 'onchain'. migrated_at: block time when known (on-chain),
+        else receive time. A mint already received by either feed is never taken twice."""
         mint = fields.get(msg, "mint", PP_SRC)
         if not mint:
             return None  # subscription ack / other message
@@ -208,17 +261,30 @@ class Scanner:
             log.info(f"ignored\t{mint}\ttxType={tx_type}\tpool={dex}")
             return None
         conn = self.ctx.conn
-        if mint in self.room or conn.execute(
+        import time as _t
+        now_t = _t.time()
+        self.seen = {m: t for m, t in self.seen.items() if now_t - t < 86400}
+        if mint in self.seen or mint in self.room or conn.execute(
             "SELECT 1 FROM scans WHERE mint=? AND ts>=?", (mint, self.ctx.night_start())
+        ).fetchone() or conn.execute(
+            "SELECT 1 FROM coins WHERE mint=? AND migrated_at IS NOT NULL", (mint,)
         ).fetchone():
+            self.dupes += 1
+            if mint not in self.seen:
+                self.seen[mint] = now_t
+            log.info(f"duplicate\t{mint}\tsource={source}\talready received")
             return None
+        self.seen[mint] = now_t   # also for coins dropped below: no second curve check
         if not await self.is_pumpfun_coin(mint):
             self.ignored += 1
-            log.info(f"ignored\t{mint}\tnot a pumpfun curve coin (pump-amm pool for another token)")
+            log.info(f"ignored\t{mint}\tnot a pumpfun curve coin (pump-amm pool for another token)\tsource={source}")
             return None
         self.migrations += 1
+        self.by_source[source] = self.by_source.get(source, 0) + 1
+        if source == "onchain":
+            self.onchain_times = [t for t in self.onchain_times if now_t - t < 3600] + [now_t]
         # PumpPortal has no migration time key (fields.py: migration_time = null) -> receive time.
-        mig = self.ctx.now_iso()
+        mig = migrated_at or self.ctx.now_iso()
         creator = fields.get(msg, "creator", PP_SRC)  # not in the PumpPortal sample -> None
         conn.execute(
             "INSERT INTO coins(mint, migrated_at, creator) VALUES (?,?,?) "
@@ -228,8 +294,98 @@ class Scanner:
         conn.commit()
         self.room[mint] = {"migratedAt": mig, "signature": fields.get(msg, "signature", PP_SRC),
                            "creator_done": False, "view": None}
-        log.info(f"migration\t{mint}\tsig={self.room[mint]['signature']}")
+        log.info(f"migration\t{mint}\tsig={self.room[mint]['signature']}\tsource={source}")
         return mint
+
+    # ---------- on-chain backup feed
+    def pumpportal_down(self, now: float) -> bool:
+        return not self.ws_connected and now - self.ws_lost_at >= ONCHAIN_DOWN_AFTER_S
+
+    def backup_last_hour(self, now: float) -> int | None:
+        """Coins the on-chain feed took in during the last hour; None when it is off."""
+        if self.ctx.cfg()["scanner.onchain_feed"] != "on":
+            return None
+        return sum(1 for t in self.onchain_times if now - t < 3600)
+
+    async def onchain_poll_once(self) -> int:
+        """1 poll of the migration authority. First poll: the last max_wait_min of history
+        (coins that can still be decided). Returns coins taken in."""
+        rpc = self.ctx.src.rpc
+        self.onchain_polls += 1
+        opts: dict[str, Any] = {"limit": 100}
+        if self.onchain_cursor:
+            opts["until"] = self.onchain_cursor
+        page = await rpc.call("getSignaturesForAddress", [MIGRATION_AUTHORITY, opts], timeout=15) or []
+        if not self.onchain_cursor:
+            horizon = self.ctx.now().timestamp() - self.ctx.cfg()["scanner.max_wait_min"] * 60
+            page = [r for r in page if (r.get("blockTime") or 0) >= horizon]
+            if not page:
+                first = await rpc.call("getSignaturesForAddress", [MIGRATION_AUTHORITY, {"limit": 1}], timeout=15) or []
+                if first:
+                    self.onchain_cursor = first[0]["signature"]
+                    log.info("onchain_start\tno migration in the last max_wait_min")
+                return 0
+        todo: list[tuple[str, int | None]] = [(sig, v[1]) for sig, v in self.onchain_retry.items()]
+        for r in reversed(page):   # oldest first
+            if r.get("err") is None and r["signature"] not in self.onchain_retry:
+                todo.append((r["signature"], r.get("blockTime")))
+        if page:
+            start = self.onchain_cursor is None
+            self.onchain_cursor = page[0]["signature"]
+            if start:
+                log.info(f"onchain_start\tbackfill {len(todo)} authority tx of the last "
+                         f"{self.ctx.cfg()['scanner.max_wait_min']} min")
+        taken = 0
+        for sig, bt in todo:
+            try:
+                tx = await rpc.call("getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
+                                                             "maxSupportedTransactionVersion": 1}], timeout=15)
+                if tx is None:
+                    raise ValueError("not yet available")
+            except RateLimited:
+                self.onchain_retry.setdefault(sig, [0, bt])
+                raise
+            except Exception as e:  # noqa: BLE001
+                ent = self.onchain_retry.setdefault(sig, [0, bt])
+                ent[0] += 1
+                if ent[0] >= ONCHAIN_MAX_TRIES:
+                    del self.onchain_retry[sig]
+                    log.info(f"onchain_tx_dropped\t{sig[:16]}\t{type(e).__name__}: {e}")
+                continue
+            self.onchain_retry.pop(sig, None)
+            bt = tx.get("blockTime") or bt
+            mig = iso(datetime.fromtimestamp(bt, timezone.utc)) if bt else None
+            for mint in migrate_mints(tx):
+                msg = {"signature": sig, "mint": mint, "txType": "migrate", "pool": "pump-amm"}
+                try:
+                    got = await asyncio.wait_for(self.on_migration(msg, source="onchain", migrated_at=mig),
+                                                 ON_MIGRATION_CAP_S)
+                except asyncio.TimeoutError:
+                    log.info(f"on_migration_timeout\t{ON_MIGRATION_CAP_S}s\t{mint}\tsource=onchain")
+                    continue
+                if got:
+                    taken += 1
+                    break   # 1 graduated coin per migrate tx
+        return taken
+
+    async def onchain_loop(self) -> None:
+        """Backup feed, always on as a dedupe safety net: every onchain_poll_s while
+        PumpPortal has been down 2+ min (or in its cooldown), else every onchain_safety_poll_s."""
+        import time as _t
+        while True:
+            cfg = self.ctx.cfg()
+            if cfg["scanner.onchain_feed"] == "on" and not bus.is_paused("scanner"):
+                try:
+                    await asyncio.wait_for(self.onchain_poll_once(), ONCHAIN_CAP_S)
+                except asyncio.TimeoutError:
+                    log.info(f"onchain_timeout\t{ONCHAIN_CAP_S}s")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001  RPC down / 429: next poll tries again
+                    log.info(f"onchain_error\t{type(e).__name__}: {str(e)[:120]}")
+            bus.beat("scanner")
+            down = self.pumpportal_down(_t.time())
+            await asyncio.sleep(cfg["scanner.onchain_poll_s"] if down else cfg["scanner.onchain_safety_poll_s"])
 
     async def is_pumpfun_coin(self, mint: str) -> bool:
         """OWN: "every coin that graduates off the pumpfun curve ... nothing else".
@@ -380,6 +536,8 @@ class Scanner:
         import time as _t
 
         now = _t.time()
+        if self.ws_connected:
+            self.ws_connected, self.ws_lost_at = False, now
         self.reconnects += 1
         alert = self.tracker.record(kind, now)
         if kind == "quiet":
@@ -392,13 +550,15 @@ class Scanner:
             log.info(f"ws_disconnect\t{self.tracker.real}\t{err}\tbackoff={backoff}s\tlast_hour={n}")
         if alert:
             n = self.tracker.real_last_hour(now)
-            await self.ctx.notifier.message(alert_text(n, self.down_since, self.last_error, now), kind="alert")
+            await self.ctx.notifier.message(alert_text(n, self.down_since, self.last_error, now,
+                                                       self.backup_last_hour(now)), kind="alert")
         return alert
 
     def on_open(self) -> None:
         import time as _t
         self.last_open, self.down_since, self.last_error = _t.time(), None, None
         self.refused_streak = 0
+        self.ws_connected = True
         log.info("ws_open")
 
     def next_wait(self, err: BaseException, backoff: float) -> float:
@@ -480,7 +640,7 @@ class Scanner:
 
     async def run(self) -> None:
         self.restore_room()
-        await asyncio.gather(self.ws_loop(), self.poll_loop())
+        await asyncio.gather(self.ws_loop(), self.poll_loop(), self.onchain_loop())
 
 
 async def run(ctx: Ctx) -> None:

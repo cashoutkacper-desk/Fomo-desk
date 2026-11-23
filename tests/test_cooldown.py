@@ -136,5 +136,5 @@ def test_ws_loop_502_logs_status_cools_down_and_alerts_feed_down(tmp_path, monke
     assert any(l.startswith("ws_disconnect\t1\tInvalidStatus 502\t") for l in lines)
     assert any(l.startswith("ws_cooldown\t10 rejections in a row (InvalidStatus 502)\twait 15 min") for l in lines)
     alert = [m["text"] for m in ctx.notifier.sent if m["kind"] == "alert"]
-    assert alert == [alert_text(11, s.down_since, "InvalidStatus 502", clock[0])]
-    assert alert[0].endswith("(PumpPortal answered HTTP 502), no new coins until it reconnects")
+    assert alert == [alert_text(11, s.down_since, "InvalidStatus 502", clock[0], 0)]
+    assert alert[0].endswith("(PumpPortal answered HTTP 502), backup on-chain feed is active (no new coins in the last hour)")

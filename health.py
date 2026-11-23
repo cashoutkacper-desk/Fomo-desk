@@ -137,6 +137,30 @@ def service_active() -> bool:
     r = subprocess.run(["systemctl", "is-active", "--quiet", SERVICE], timeout=20)
     return r.returncode == 0
 
+def count_onchain(log_dir: Path, now_local: datetime, window_s: int = 3600) -> int:
+    """Coins the on-chain backup feed took in: 'migration\t<mint>\t...\tsource=onchain'."""
+    since = now_local - timedelta(seconds=window_s)
+    n = 0
+    for ln in _log_lines(log_dir, "scanner"):
+        parts = ln.split("\t")
+        if len(parts) < 2 or parts[1] != "migration" or parts[-1] != "source=onchain":
+            continue
+        m = _TS.match(ln)
+        if m and since <= datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S") <= now_local:
+            n += 1
+    return n
+
+
+def backup_count(conn: sqlite3.Connection, log_dir: Path, now_local: datetime) -> int | None:
+    """On-chain coins in the last hour, None when the backup feed is switched off."""
+    try:
+        import config
+        if config.load(conn)["scanner.onchain_feed"] != "on":
+            return None
+    except Exception:  # noqa: BLE001  settings unreadable -> default (on)
+        pass
+    return count_onchain(log_dir, now_local)
+
 
 def restart_service() -> bool:
     # desk may run exactly this via sudoers (/etc/sudoers.d/desk-health); nothing else
@@ -183,14 +207,15 @@ async def run(conn: sqlite3.Connection, notifier: Any, log_dir: Path, *,
         if not already:
             text = f"{ALERT_PREFIX}{n_rec} times in the last hour (PumpPortal)"
             if feed["down"]:
-                from agents.scanner import why_text
+                from agents.scanner import backup_text, why_text
                 why = why_text(feed["error"])
                 text += (f" · feed down since {feed['down_since']:%-I:%M %p} ({why}),"
-                         " no new coins until it reconnects")
+                         f" {backup_text(backup_count(conn, log_dir, nl))}")
             alerted = await notifier.message(text, kind="alert")
     return {"ok": fresh, "restarted": restarted, "down_min": max([n for _, n in stale], default=0),
             "reconnects_1h": n_rec, "alerted": alerted, "already_alerted": already,
-            "feed_down_since": feed["down_since"].strftime("%Y-%m-%d %H:%M") if feed["down"] else None}
+            "feed_down_since": feed["down_since"].strftime("%Y-%m-%d %H:%M") if feed["down"] else None,
+            "onchain_1h": backup_count(conn, log_dir, nl)}
 
 
 def main() -> int:

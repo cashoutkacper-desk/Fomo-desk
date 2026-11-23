@@ -52,7 +52,7 @@ def test_healthy_does_nothing(tmp_path):
     _beats(ctx.conn, NOW, ALL_FRESH)
     res, calls = _health(ctx, tmp_path)
     assert res == {"ok": True, "restarted": [], "down_min": 0, "reconnects_1h": 0, "alerted": False,
-                   "already_alerted": False, "feed_down_since": None}
+                   "already_alerted": False, "feed_down_since": None, "onchain_1h": 0}
     assert calls == [] and ctx.notifier.sent == []
 
 
@@ -320,7 +320,10 @@ def test_feed_refused_for_an_hour_alerts_with_down_since(tmp_path):
     _beats(ctx.conn, NOW, ALL_FRESH)
     nl = NOW.replace(tzinfo=None)
     start = _refused_log(tmp_path, nl)
+    import config
+    config.set_value(ctx.conn, "scanner.onchain_feed", "off")     # backup feed off -> old wording
     res, _ = _health(ctx, tmp_path)
+    assert res["onchain_1h"] is None
     assert res["reconnects_1h"] == 60 and res["alerted"] is True and res["already_alerted"] is False
     assert res["feed_down_since"] == f"{start:%Y-%m-%d %H:%M}"
     assert ctx.notifier.sent[-1]["text"] == (f"Websocket dropped 60 times in the last hour (PumpPortal) · feed down since "
@@ -361,8 +364,13 @@ def test_health_alert_names_the_http_status(tmp_path):
     for i in range(70):
         t = start + timedelta(minutes=i)
         lines.append(f"{t:%Y-%m-%d %H:%M:%S},000\tws_disconnect\t{i + 1}\tInvalidStatus 502\tbackoff=60s\tlast_hour=60")
+    for m in (65, 20, 10, 5):    # on-chain backup coins: 1 older than an hour, 3 inside it
+        lines.append(f"{nl - timedelta(minutes=m):%Y-%m-%d %H:%M:%S},000\tmigration\tMint{m}pump\tsig=s{m}\tsource=onchain")
+    lines.append(f"{nl - timedelta(minutes=3):%Y-%m-%d %H:%M:%S},000\tmigration\tOtherpump\tsig=x\tsource=pumpportal")
     (tmp_path / "scanner.log").write_text("\n".join(lines) + "\n")
     res, _ = _health(ctx, tmp_path)
     assert res["alerted"] and res["feed_down_since"] == f"{start:%Y-%m-%d %H:%M}"
+    assert res["onchain_1h"] == 3
     assert ctx.notifier.sent[-1]["text"].endswith(
-        f"feed down since {start:%-I:%M %p} (PumpPortal answered HTTP 502), no new coins until it reconnects")
+        f"feed down since {start:%-I:%M %p} (PumpPortal answered HTTP 502), "
+        "backup on-chain feed is active (3 coins in the last hour), coins still coming in")
