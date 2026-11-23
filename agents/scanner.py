@@ -66,6 +66,31 @@ class ReconnectTracker:
 FEED_DOWN_AFTER_S = 300   # no good open for 5 min while failing = "feed down" in the alert
 
 
+def err_label(e: BaseException) -> str:
+    """'ConnectionRefusedError', or 'InvalidStatus 502' when the server answered the
+    websocket upgrade with an HTTP status (websockets' InvalidStatus carries .response)."""
+    name = type(e).__name__
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{name} {code}" if code is not None else name
+
+
+def is_rejection(e: BaseException) -> bool:
+    """PumpPortal turning us away: TCP refused, or an HTTP status instead of the upgrade
+    (403/429 ban, 5xx their side). Kacper's cooldown applies to both (Nov 20 + Nov 23)."""
+    return isinstance(e, ConnectionRefusedError) or getattr(getattr(e, "response", None), "status_code", None) is not None
+
+
+def why_text(err: str | None) -> str:
+    if not err:
+        return "error"
+    if err == "ConnectionRefusedError":
+        return "connection refused"
+    parts = err.split()
+    if len(parts) == 2 and parts[1].isdigit():
+        return f"PumpPortal answered HTTP {parts[1]}"
+    return err
+
+
 def alert_text(n: int, down_since: float | None, err: str | None, now: float) -> str:
     """'Websocket dropped {n} times in the last hour (PumpPortal)' (STEP 12 text, desk-health
     dedupes on that prefix) + when no connect has worked for 5 min: since when and why,
@@ -75,8 +100,7 @@ def alert_text(n: int, down_since: float | None, err: str | None, now: float) ->
         from datetime import datetime, timezone
         from runtime import local_hhmm
         since = local_hhmm(iso(datetime.fromtimestamp(down_since, timezone.utc)))
-        why = {"ConnectionRefusedError": "connection refused"}.get(err or "", err or "error")
-        text += f" · feed down since {since} ({why}), no new coins until it reconnects"
+        text += f" · feed down since {since} ({why_text(err)}), no new coins until it reconnects"
     return text
 
 
@@ -379,9 +403,10 @@ class Scanner:
 
     def next_wait(self, err: BaseException, backoff: float) -> float:
         """Seconds to wait before the next connect. Normal: the backoff (1, 2, 4 ... 60).
-        Kacper, Nov 20: after [10] connection refusals in a row (PumpPortal blocking us)
-        wait [15] min once, then the normal backoff again; a good open resets the count."""
-        if not isinstance(err, ConnectionRefusedError):
+        Kacper (Nov 20, extended Nov 23): after [10] rejections in a row (TCP refused, or an
+        HTTP status such as 502/403/429 instead of the upgrade) wait [15] min once, then the
+        normal backoff again; a good open resets the count."""
+        if not is_rejection(err):
             self.refused_streak = 0
             return backoff
         self.refused_streak += 1
@@ -390,7 +415,8 @@ class Scanner:
             n, self.refused_streak = self.refused_streak, 0
             self.cooldowns += 1
             wait = cfg["scanner.refused_cooldown_min"] * 60
-            log.info(f"ws_cooldown\t{n} refusals in a row\twait {cfg['scanner.refused_cooldown_min']} min\tcooldown={self.cooldowns}")
+            log.info(f"ws_cooldown\t{n} rejections in a row ({err_label(err)})\t"
+                     f"wait {cfg['scanner.refused_cooldown_min']} min\tcooldown={self.cooldowns}")
             return wait
         return backoff
 
@@ -429,7 +455,7 @@ class Scanner:
                 await self.on_reconnect("quiet", "idle", 0)
                 continue
             except Exception as e:  # noqa: BLE001  socket error, server close, failed connect
-                await self.on_reconnect("real", type(e).__name__, backoff)
+                await self.on_reconnect("real", err_label(e), backoff)
                 await asyncio.sleep(self.next_wait(e, backoff))
                 backoff = min(backoff * 2, 60)
 

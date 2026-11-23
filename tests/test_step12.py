@@ -350,3 +350,19 @@ def test_quiet_reconnects_all_night_are_not_drops_and_feed_is_up(tmp_path):
     (tmp_path / "scanner.log").write_text("\n".join(lines) + "\n")
     assert health.count_reconnects(tmp_path, nl) == 0
     assert health.feed_state(tmp_path, nl)["down"] is False
+
+
+def test_health_alert_names_the_http_status(tmp_path):
+    ctx = make_ctx(tmp_path)
+    _beats(ctx.conn, NOW, ALL_FRESH)
+    nl = NOW.replace(tzinfo=None)
+    start = nl - timedelta(minutes=70)
+    lines = [f"{start - timedelta(minutes=1):%Y-%m-%d %H:%M:%S},000\tws_open"]
+    for i in range(70):
+        t = start + timedelta(minutes=i)
+        lines.append(f"{t:%Y-%m-%d %H:%M:%S},000\tws_disconnect\t{i + 1}\tInvalidStatus 502\tbackoff=60s\tlast_hour=60")
+    (tmp_path / "scanner.log").write_text("\n".join(lines) + "\n")
+    res, _ = _health(ctx, tmp_path)
+    assert res["alerted"] and res["feed_down_since"] == f"{start:%Y-%m-%d %H:%M}"
+    assert ctx.notifier.sent[-1]["text"].endswith(
+        f"feed down since {start:%-I:%M %p} (PumpPortal answered HTTP 502), no new coins until it reconnects")

@@ -183,7 +183,8 @@ async def run(conn: sqlite3.Connection, notifier: Any, log_dir: Path, *,
         if not already:
             text = f"{ALERT_PREFIX}{n_rec} times in the last hour (PumpPortal)"
             if feed["down"]:
-                why = {"ConnectionRefusedError": "connection refused"}.get(feed["error"] or "", feed["error"] or "error")
+                from agents.scanner import why_text
+                why = why_text(feed["error"])
                 text += (f" · feed down since {feed['down_since']:%-I:%M %p} ({why}),"
                          " no new coins until it reconnects")
             alerted = await notifier.message(text, kind="alert")
