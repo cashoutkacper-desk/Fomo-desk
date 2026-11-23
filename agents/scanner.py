@@ -32,6 +32,8 @@ POLL_CAP_S = 120            # wall-clock cap on 1 waiting-room poll
 ONCHAIN_CAP_S = 90          # wall-clock cap on 1 on-chain backup poll
 ONCHAIN_DOWN_AFTER_S = 120  # PumpPortal not connected this long -> backup polls fast
 ONCHAIN_MAX_TRIES = 5       # getTransaction failures before a signature is dropped
+ONCHAIN_TX_PER_POLL = 20    # getTransaction calls per poll at most (rest wait for the next poll)
+ONCHAIN_TX_GAP_S = 0.35     # spacing between getTransaction calls (public RPC 429s on bursts)
 # pump.fun's migration authority signs every graduation (MigrateV2 onto PumpSwap).
 MIGRATION_AUTHORITY = "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"
 WSOL = "So11111111111111111111111111111111111111112"
@@ -336,15 +338,22 @@ class Scanner:
                 log.info(f"onchain_start\tbackfill {len(todo)} authority tx of the last "
                          f"{self.ctx.cfg()['scanner.max_wait_min']} min")
         taken = 0
-        for sig, bt in todo:
+        for i, (sig, bt) in enumerate(todo):
+            if i >= ONCHAIN_TX_PER_POLL:
+                self.defer(todo[i:])
+                log.info(f"onchain_deferred\t{len(todo) - i} tx to the next poll (max {ONCHAIN_TX_PER_POLL}/poll)")
+                break
+            if i and not self.ctx.fast:
+                await asyncio.sleep(ONCHAIN_TX_GAP_S)
             try:
                 tx = await rpc.call("getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
                                                              "maxSupportedTransactionVersion": 1}], timeout=15)
                 if tx is None:
                     raise ValueError("not yet available")
             except RateLimited:
-                self.onchain_retry.setdefault(sig, [0, bt])
-                raise
+                self.defer(todo[i:])
+                log.info(f"onchain_429\t{len(todo) - i} tx to the next poll")
+                break
             except Exception as e:  # noqa: BLE001
                 ent = self.onchain_retry.setdefault(sig, [0, bt])
                 ent[0] += 1
@@ -367,6 +376,11 @@ class Scanner:
                     taken += 1
                     break   # 1 graduated coin per migrate tx
         return taken
+
+    def defer(self, items: list[tuple[str, int | None]]) -> None:
+        """Signatures not fetched this poll (cap or 429): next poll first, tries unchanged."""
+        for sig, bt in items:
+            self.onchain_retry.setdefault(sig, [0, bt])
 
     async def onchain_loop(self) -> None:
         """Backup feed, always on as a dedupe safety net: every onchain_poll_s while

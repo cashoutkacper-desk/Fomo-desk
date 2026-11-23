@@ -211,3 +211,27 @@ def test_feed_down_alert_says_backup_is_bringing_coins(tmp_path):
     chain.add("s1", _tx(MINT))
     run(s.onchain_poll_once())
     assert s.backup_last_hour(time.time()) == 1
+
+
+def test_429_and_per_poll_cap_defer_signatures_never_lose_them(tmp_path, monkeypatch):
+    import agents.scanner as sc
+    monkeypatch.setattr(sc, "ONCHAIN_TX_PER_POLL", 3)
+    ctx, chain, s = _setup(tmp_path)
+    mints = [f"{c * 40}pump"[:44] for c in "ABCDEFG"]
+    for i, m in enumerate(mints):
+        chain.add(f"s{i}", _tx(m), minutes_ago=10 - i)
+    assert run(s.onchain_poll_once()) == 3 and len(s.onchain_retry) == 4      # cap: 4 wait
+    real = chain.call
+    n = [0]
+
+    async def limited(method, params, **k):
+        if method == "getTransaction":
+            n[0] += 1
+            if n[0] == 2:
+                raise sources.RateLimited("rpc getTransaction")
+        return await real(method, params, **k)
+    ctx.src.rpc.call = limited
+    assert run(s.onchain_poll_once()) == 1 and len(s.onchain_retry) == 3      # 429 on the 2nd: rest wait
+    ctx.src.rpc.call = real
+    assert run(s.onchain_poll_once()) == 3 and not s.onchain_retry
+    assert set(s.room) == set(mints)                                          # every coin, in order
