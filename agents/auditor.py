@@ -51,7 +51,13 @@ def _graph_key(field: str) -> str:
 
 def biggest_group(graph: Any) -> int | None:
     """Layer 7. Wallets = nodes holding this mint; edges = links between them.
-    Bundled = size of the biggest connected group. None = no links key anywhere."""
+    Bundled = size of the biggest connected group.
+    A valid empty list [] means RugCheck found no insider network -> 0 ("None").
+    None = missing, errored, or malformed (no links key anywhere)."""
+    # RugCheck returns [] when it has looked and found no network (Nov 23: 29 coins
+    # wrongly rejected as "no data: bundles"). Errors and malformed bodies stay None.
+    if graph == []:
+        return 0
     nets = graph if isinstance(graph, list) else ([graph] if isinstance(graph, dict) else [])
     k_nodes, k_links = _graph_key("insiders_graph_nodes"), _graph_key("insiders_graph_links")
     k_id, k_hold = _graph_key("insiders_graph_node_id"), _graph_key("insiders_graph_node_holdings")

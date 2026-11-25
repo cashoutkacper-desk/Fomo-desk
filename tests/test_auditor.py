@@ -44,18 +44,17 @@ def test_clean_coin_8_of_8_to_analyst(tmp_path):
     assert len(events) == 8
 
 
-def test_empty_graph_is_red_no_data_bundles(tmp_path):
+def test_empty_graph_is_zero_bundles_and_the_audit_continues(tmp_path):
+    """RugCheck's valid empty answer [] = no insider network, not 'no data'."""
     ctx = make_ctx(tmp_path)
     add_coin(ctx)
     ctx.src.rugcheck.graph_body = []
     out = run(Auditor(ctx).audit(SCAN))
-    assert out["passed"] is False
-    assert out["layersChecked"] == 7 and out["reason"] == "no data: bundles"
-    assert out["layers"][6] == {"n": 7, "name": "Bundled wallets", "pass": False,
-                                "value": "no data: bundles", "source": "rugcheck"}
-    assert out["layers"][7]["value"] == "not checked"
-    a = ctx.conn.execute("SELECT subtitle FROM activity").fetchone()[0]
-    assert a == "Auditor · no data: bundles"
+    assert out["passed"] is True and out["layersChecked"] == 8
+    assert out["layers"][6] == {"n": 7, "name": "Bundled wallets", "pass": True,
+                                "value": "None", "source": "rugcheck"}
+    assert out["layers"][7]["pass"] is True
+    assert ctx.conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0] == 0
 
 
 def test_dev_sold_and_dev_holds(tmp_path):
@@ -103,7 +102,10 @@ def test_bundles_group_counts_only_holders():
                     {"source": "C", "target": "D"}, {"source": "D", "target": "E"},
                     {"source": "E", "target": "F"}, {"source": "F", "target": "G"}]}]
     assert biggest_group(g) == 4     # D-E-F-G ; C holds nothing so A-B is cut off
-    assert biggest_group([]) is None and biggest_group([{"nodes": []}]) is None
+    assert biggest_group([]) == 0                                 # valid empty: no network
+    assert biggest_group([{"nodes": []}]) is None                 # malformed: no links key
+    assert biggest_group(None) is None and biggest_group({}) is None
+    assert biggest_group("error") is None and biggest_group([{"links": []}]) == 0
 
 
 def test_rejected_mint_not_reaudited(tmp_path):
@@ -130,3 +132,23 @@ def test_top10_falls_back_to_program_accounts_on_429(tmp_path):
     ctx.src.rpc.program_accounts_list = accs
     out = run(Auditor(ctx).audit(SCAN))
     assert out["layers"][3]["value"] == "10.0%"     # pool vault excluded, 10 x 1%
+
+
+def test_graph_error_is_still_no_data_bundles(tmp_path):
+    """A failed or missing graph is still red; only a valid empty [] is a pass."""
+    from sources import SourceError
+    ctx = make_ctx(tmp_path)
+    add_coin(ctx)
+
+    async def boom(mint):
+        raise SourceError("rugcheck HTTP 500")
+    ctx.src.rugcheck.graph = boom
+    out = run(Auditor(ctx).audit(SCAN))
+    assert out["passed"] is False and out["reason"] == "no data: bundles"
+    assert out["layersChecked"] == 7 and out["layers"][7]["value"] == "not checked"
+
+    ctx2 = make_ctx(tmp_path / "malformed")
+    add_coin(ctx2)
+    ctx2.src.rugcheck.graph_body = [{"nodes": []}]     # dict without a links key
+    out2 = run(Auditor(ctx2).audit(SCAN))
+    assert out2["passed"] is False and out2["reason"] == "no data: bundles"
